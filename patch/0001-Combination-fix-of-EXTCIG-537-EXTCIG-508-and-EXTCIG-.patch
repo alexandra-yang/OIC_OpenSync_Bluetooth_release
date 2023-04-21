@@ -1,0 +1,184 @@
+From fe740b6f7e62737f5b5ff3b0595c759a11097a01 Mon Sep 17 00:00:00 2001
+From: ayang <ayang@plume.com>
+Date: Mon, 27 Mar 2023 12:48:58 +0800
+Subject: [PATCH] Combination fix of EXTCIG-537, EXTCIG-508 and EXTCIG-491
+
+Root Cause:
+EXTCIG-537+EXTCIG-631: Incorrect sequence cause client connecting to leaf node ain't get IP.
+EXTCIG-508: has_L3 was be reset in IF_CARRIER state which cause leaf interface be added to bridge slower than before.
+EXTCIG-491: if parent interface(eth0/1) be added to br-home, then there is no way for device pppoe onboard.
+
+Solution:
+EXTCIG-537+EXTCIG-631: Change WANO plugin sequence to
+      ethclient(0)->vlan(40)->dhcpv4(50)->dhcpv6(50)->pppoe(90)->static_ip(100)
+
+EXTCIG-508: Add a enum 'WANO_TRI_DONTCARE' to make has_L3 remained its prevoius states.
+EXTCIG-491: Reset has_L3 of parent interface as none whenever the pppoe or vlan is launched.
+
+Signed-off-by: ayang <ayang@plume.com>
+---
+ src/wano/inc/wano.h                           |  1 +
+ src/wano/src/wano_connection_manager_uplink.c |  9 +++++++++
+ src/wano/src/wano_ppline.c                    |  8 +++++---
+ src/wano/src/wanp_dhcpv4.c                    |  2 +-
+ src/wano/src/wanp_dhcpv6.c                    |  2 +-
+ src/wano/src/wanp_pppoe.c                     | 14 +++++++++++++-
+ src/wano/src/wanp_static_ipv4.c               |  2 +-
+ src/wano/src/wanp_vlan.c                      | 12 ++++++++++++
+ 8 files changed, 43 insertions(+), 7 deletions(-)
+
+diff --git a/src/wano/inc/wano.h b/src/wano/inc/wano.h
+index fc61f1374..39a43a462 100644
+--- a/src/wano/inc/wano.h
++++ b/src/wano/inc/wano.h
+@@ -314,6 +314,7 @@ typedef enum wano_tri
+     WANO_TRI_NONE = 0,
+     WANO_TRI_TRUE,
+     WANO_TRI_FALSE,
++    WANO_TRI_DONTCARE,
+ }
+ wano_tri_t;
+ 
+diff --git a/src/wano/src/wano_connection_manager_uplink.c b/src/wano/src/wano_connection_manager_uplink.c
+index 4e6c8d468..fcf1d353c 100644
+--- a/src/wano/src/wano_connection_manager_uplink.c
++++ b/src/wano/src/wano_connection_manager_uplink.c
+@@ -339,6 +339,15 @@ bool wano_connmgr_uplink_update(
+     {
+         SCHEMA_SET_INT(conn_up.has_L3, false);
+     }
++    else if (args->has_L3 == WANO_TRI_NONE)
++    {
++        SCHEMA_UNSET_FIELD(conn_up.has_L3);
++    }
++    else
++    {
++        // WANO_TRI_DONCARE: do nothing
++    }
++
+ 
+     if (args->loop == WANO_TRI_TRUE)
+     {
+diff --git a/src/wano/src/wano_ppline.c b/src/wano/src/wano_ppline.c
+index 3d1757006..a86f2bc2d 100644
+--- a/src/wano/src/wano_ppline.c
++++ b/src/wano/src/wano_ppline.c
+@@ -754,7 +754,8 @@ enum wano_ppline_state wano_ppline_state_INIT(
+     if (!WANO_CONNMGR_UPLINK_UPDATE(
+                 self->wpl_ifname,
+                 .if_type = self->wpl_iftype,
+-                .has_L2 = WANO_TRI_FALSE))
++                .has_L2 = WANO_TRI_FALSE,
++                .has_L3 = WANO_TRI_DONTCARE))
+     {
+         LOG(WARN, "wano: %s: Error updating Connection_Manager_Uplink (iftype = %s, has_L2 = false)",
+                 self->wpl_ifname, self->wpl_iftype);
+@@ -851,8 +852,9 @@ enum wano_ppline_state wano_ppline_state_IF_CARRIER(
+ 
+             self->wpl_carrier_exception = true;
+ 
+-            if (!WANO_CONNMGR_UPLINK_UPDATE(self->wpl_ifname, .has_L2 = WANO_TRI_TRUE))
+-            {
++            if (!WANO_CONNMGR_UPLINK_UPDATE(self->wpl_ifname,
++                                            .has_L2 = WANO_TRI_TRUE,
++                                            .has_L3 = WANO_TRI_DONTCARE)) {
+                 LOG(WARN, "wano: %s: Error updating Connection_Manager_Uplinkg talbe (has_L2 = true).",
+                         self->wpl_ifname);
+             }
+diff --git a/src/wano/src/wanp_dhcpv4.c b/src/wano/src/wanp_dhcpv4.c
+index 2643e34e9..521416ddb 100644
+--- a/src/wano/src/wanp_dhcpv4.c
++++ b/src/wano/src/wanp_dhcpv4.c
+@@ -26,7 +26,7 @@ static wano_inet_state_event_fn_t wanp_dhcpv4_inet_state_event_fn;
+ 
+ static struct wano_plugin wanp_dhcpv4 = WANO_PLUGIN_INIT(
+         "dhcpv4",
+-        100,
++        50,
+         WANO_PLUGIN_MASK_IPV4,
+         wanp_dhcpv4_init,
+         wanp_dhcpv4_run,
+diff --git a/src/wano/src/wanp_dhcpv6.c b/src/wano/src/wanp_dhcpv6.c
+index fd9f762f9..a310da60a 100644
+--- a/src/wano/src/wanp_dhcpv6.c
++++ b/src/wano/src/wanp_dhcpv6.c
+@@ -43,7 +43,7 @@ static ds_tree_t wanp_dhcpv6_ovsdb_list = DS_TREE_INIT(ds_str_cmp, struct wanp_d
+ 
+ static struct wano_plugin wanp_dhcpv6 = WANO_PLUGIN_INIT(
+         "dhcpv6",
+-        100,
++        50,
+         WANO_PLUGIN_MASK_IPV6,
+         wanp_dhcpv6_init,
+         wanp_dhcpv6_run,
+diff --git a/src/wano/src/wanp_pppoe.c b/src/wano/src/wanp_pppoe.c
+index 9c51c7e10..633a79205 100644
+--- a/src/wano/src/wanp_pppoe.c
++++ b/src/wano/src/wanp_pppoe.c
+@@ -34,7 +34,7 @@ static bool wanp_pppoe_get_wan_config(struct wanp_pppoe_handle *wh);
+ 
+ static struct wano_plugin wanp_pppoe = WANO_PLUGIN_INIT(
+         "pppoe",
+-        50,
++        90,
+         WANO_PLUGIN_MASK_IPV4 | WANO_PLUGIN_MASK_IPV6,
+         wanp_pppoe_init,
+         wanp_pppoe_run,
+@@ -95,6 +95,18 @@ enum wanp_pppoe_state wanp_pppoe_state_ENABLE_PPPOE(
+     wpoe = CONTAINER_OF(state, struct wanp_pppoe_handle, wpoe_state);
+     is = data;
+ 
++    /* WANO will set has_L3 as false which leads interface being added to the
++     * bridge. Once the interface be added to bridge, the pppoe will never
++     * success. To avoid that situation, we set has_L3 as NONE whenever pppoe
++     * plugin is launched. */
++    if (!WANO_CONNMGR_UPLINK_UPDATE(wpoe->wpoe_handle.wh_ifname,
++                                    .has_L3 = WANO_TRI_NONE)) {
++        LOG(WARN,
++            "wano: %s: Error updating the Connection_Manager_Uplink "
++            "table (has_L3 = set[])",
++            wpoe->wpoe_handle.wh_ifname);
++    }
++
+     switch (action)
+     {
+         case wanp_pppoe_do_STATE_INIT:
+diff --git a/src/wano/src/wanp_static_ipv4.c b/src/wano/src/wanp_static_ipv4.c
+index 427f99c18..82546ec9f 100644
+--- a/src/wano/src/wanp_static_ipv4.c
++++ b/src/wano/src/wanp_static_ipv4.c
+@@ -49,7 +49,7 @@ static wano_inet_state_event_fn_t wanp_static_ipv4_inet_state_event_fn;
+ 
+ static struct wano_plugin wanp_static_ipv4 = WANO_PLUGIN_INIT(
+         "static_ipv4",
+-        90,
++        100,
+         WANO_PLUGIN_MASK_IPV4,
+         wanp_static_ipv4_init,
+         wanp_static_ipv4_run,
+diff --git a/src/wano/src/wanp_vlan.c b/src/wano/src/wanp_vlan.c
+index 8751f9296..e7c9dcbe2 100644
+--- a/src/wano/src/wanp_vlan.c
++++ b/src/wano/src/wanp_vlan.c
+@@ -70,6 +70,18 @@ wano_plugin_handle_t *wanp_vlan_init(
+             self->wvl_handle.wh_ifname,
+             self->wvl_wan_config.wc_type_vlan.wc_vlanid);
+ 
++    /* WANO will set has_L3 as false which leads interface being added to the
++     * bridge. Once the interface be added to bridge, the pppoe will never
++     * success. To avoid that situation, we set has_L3 as NONE whenever vlan
++     * plugin is launched. */
++    if (!WANO_CONNMGR_UPLINK_UPDATE(self->wvl_handle.wh_ifname,
++                                    .has_L3 = WANO_TRI_NONE)) {
++        LOG(WARN,
++            "wano: %s: Error updating the Connection_Manager_Uplink "
++            "table (has_L3 = set[])",
++            self->wvl_handle.wh_ifname);
++    }
++
+     wano_ppline_event_init(&self->wvl_ppe, wanp_vlan_ppline_event_fn);
+ 
+     LOG(INFO, "wanp_vlan: Creating interface %s with VLAN ID %d.",
+-- 
+2.34.1
+
